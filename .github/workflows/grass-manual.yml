@@ -1,4 +1,4 @@
-nname: GRASS GIS addon manual
+name: GRASS GIS addon manual
 
 on:
   push:
