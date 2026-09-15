@@ -1,0 +1,240 @@
+name: Generate Third-Party Licenses
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: "Path to the Dockerfile"
+        required: false
+        type: string
+      requirements:
+        description: "Path to the requirements.txt file"
+        required: false
+        type: string
+      pyproject:
+        description: "Path to the pyproject.toml file"
+        required: false
+        type: string
+      additional-packages:
+        description: "Space-separated list of system packages to install before creating the Python environment (optional)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  generate:
+    name: Generate THIRD_PARTY_LICENSES.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate inputs
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          count=0
+          source_type=""
+          source_path=""
+
+          if [ -n "${{ inputs.dockerfile }}" ]; then
+            count=$((count + 1))
+            source_type="dockerfile"
+            source_path="${{ inputs.dockerfile }}"
+          fi
+          if [ -n "${{ inputs.requirements }}" ]; then
+            count=$((count + 1))
+            source_type="requirements"
+            source_path="${{ inputs.requirements }}"
+          fi
+          if [ -n "${{ inputs.pyproject }}" ]; then
+            count=$((count + 1))
+            source_type="pyproject"
+            source_path="${{ inputs.pyproject }}"
+          fi
+
+          if [ "$count" -eq 0 ]; then
+            echo "::error::One of the inputs 'dockerfile', 'requirements' or 'pyproject' has to be set."
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Only one of the inputs 'dockerfile', 'requirements' or 'pyproject' may be set."
+            exit 1
+          fi
+          if [ ! -f "$source_path" ]; then
+            echo "::error::File '$source_path' not found."
+            exit 1
+          fi
+
+          echo "source-type=$source_type" >> "$GITHUB_OUTPUT"
+          echo "source-path=$source_path" >> "$GITHUB_OUTPUT"
+
+      - name: Install additional system packages
+        if: (inputs.requirements != '' || inputs.pyproject != '') && inputs.additional-packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ inputs.additional-packages }}
+
+
+      # --- Case 1: requirements.txt -------------------------------------
+      - name: Licenses from requirements.txt
+        if: inputs.requirements != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .license-venv
+          source .license-venv/bin/activate
+          pip install --upgrade pip pip-licenses --quiet
+          if grep -qi '^gdal' "${{ inputs.requirements }}"; then
+            echo "GDAL==$(gdal-config --version).*" > /tmp/constraints.txt
+            pip install -r "${{ inputs.requirements }}" -c /tmp/constraints.txt
+          else
+            pip install -r "${{ inputs.requirements }}"
+          fi
+          pip-licenses --from=mixed --with-authors --with-urls --with-license-file --format=json --output-file=THIRD_PARTY_LICENSES.json
+
+      # --- Case 2: pyproject.toml ----------------------------------------
+      - name: Licenses from pyproject.toml
+        if: inputs.pyproject != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .license-venv
+          source .license-venv/bin/activate
+          pip install --upgrade pip pip-licenses --quiet
+          project_dir=$(dirname "${{ inputs.pyproject }}")
+          pip install "$project_dir"
+          pip-licenses --from=mixed --with-authors --with-urls --with-license-file --format=json --output-file=THIRD_PARTY_LICENSES.json
+
+      # --- Case 3: Dockerfile ---------------------------------------------
+      # Build the image and executes pip-licenses inside the docker container
+      - name: Licenses from Dockerfile
+        if: inputs.dockerfile != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            -t license-scan-image \
+            -f "${{ inputs.dockerfile }}" .
+          docker run --entrypoint sh --rm -v "$PWD":/output license-scan-image -c "
+            python -m pip install --upgrade pip pip-licenses &&
+            pip-licenses --from=mixed --with-authors --with-urls --with-license-file --format=json --output-file=/output/pip-licenses.json
+          "
+      - name: Generate SBOM from Docker image
+        if: inputs.dockerfile != ''
+        uses: anchore/sbom-action@v0.24.2
+        with:
+          image: license-scan-image
+          format: syft-json
+          output-file: sbom.json
+          upload-artifact: false
+          # upload-artifact: true
+          # artifact-name: sbom.json
+      - name: Merge licenses
+        if: inputs.dockerfile != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q https://raw.githubusercontent.com/mundialis/github-workflows/refs/heads/main/.github/scripts/merge-licenses.py
+          python3 merge-licenses.py pip-licenses.json sbom.json THIRD_PARTY_LICENSES.json
+
+      - name: Validate Output
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -s THIRD_PARTY_LICENSES.json ]; then
+            echo "::error::THIRD_PARTY_LICENSES.json not created or is empty."
+            exit 1
+          fi
+          python3 -c "import json; json.load(open('THIRD_PARTY_LICENSES.json'))"
+
+      - name: Upload THIRD_PARTY_LICENSES.json as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: third-party-license
+          path: THIRD_PARTY_LICENSES.json
+
+      - name: Upload as release asset
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./THIRD_PARTY_LICENSES.json
+          asset_name: THIRD_PARTY_LICENSES.json
+          asset_content_type: application/json
+
+  license-scan:
+    runs-on: ubuntu-latest
+    needs: generate
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download THIRD_PARTY_LICENSES.json
+        uses: actions/download-artifact@v8
+        with:
+          name: third-party-license
+          path: .
+
+      - name: Scan THIRD_PARTY_LICENSES.json for UNKNOWN / GPL/AGPL/LGPL
+        run: |
+          set -e
+
+          FILE="THIRD_PARTY_LICENSES.json"
+
+          if [ ! -f "$FILE" ]; then
+            echo "::error file=$FILE::File $FILE not found."
+            exit 1
+          fi
+
+          # Python-Skript: scans JSON, raise warning und creates summary table
+          python3 - << 'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          file_path = Path("THIRD_PARTY_LICENSES.json")
+          data = json.loads(file_path.read_text(encoding="utf-8"))
+
+          # Expected format: List of objects with Name, Author, License, URL
+          entries = data if isinstance(data, list) else []
+
+          problem_entries = []
+
+          for e in entries:
+              category = None
+              if any(["UNKNOWN" in val.upper() for val in e.values()]):
+                  category = "UNKNOWN"
+              license_val = e.get("License", "")
+              if license_val:
+                  lic = str(license_val).strip()
+                  is_gpl_like = any(
+                      x in lic.upper()
+                      for x in ["GPL", "AGPL", "LGPL"]
+                  )
+                  category = "GPL/AGPL/LGPL" if is_gpl_like else category
+              if category is not None:
+                  name = e.get("Name", "")
+                  author = e.get("Author", "")
+                  url = e.get("URL", "")
+                  license_file = e.get("LicenseFile", "")
+                  license_text = e.get("LicenseText", "")
+
+                  problem_entries.append({
+                      "Name": name,
+                      "Author": author,
+                      "License": lic,
+                      "URL": url,
+                      "Category": category,
+                  })
+
+          # Warn-Annotationen for each entry
+          for e in problem_entries:
+              msg = f"{e['Category']}: {e['Name']} {e['Author']} ({e['License']})"
+              print(f"::warning title=License-Scan::{msg}")
+          if problem_entries:
+              sys.exit(1)
+          PY
