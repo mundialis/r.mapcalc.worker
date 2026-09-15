@@ -1,9 +1,15 @@
-name: GRASS GIS addon manual
+nname: GRASS GIS addon manual
 
 on:
   push:
     branches: [ main ]
 
+permissions: {}
+
 jobs:
   grass-manual:
     uses: mundialis/github-workflows/.github/workflows/grass-manual.yml@main
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
